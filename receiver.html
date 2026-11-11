@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>WebRTC Receiver</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: black;
+        }
+        video {
+            position: fixed;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: fill;
+        }
+        #loading {
+            position: fixed;
+            inset: 0;
+            background: black;
+            color: white;
+
+            display: flex;
+            align-items: center;
+            justify-content: center;
+
+            font-family: Arial, sans-serif;
+            font-size: 32px;
+
+            z-index: 10;
+        }
+        #stats {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            z-index: 20;
+
+            color: white;
+            background: rgba(0, 0, 0, 0.6);
+
+            padding: 8px 12px;
+
+            font-family: Arial, sans-serif;
+            font-size: 16px;
+            line-height: 1.5;
+
+            pointer-events: none;
+        }
+    </style>
+</head>
+
+<body>
+<div id="loading">
+    Loading...
+</div>
+<div id="stats">
+    Codec: -
+    <br>
+    FPS: -
+    <br>
+    Resolution: -
+    <br>
+    Game: -
+    <br>
+    Player: -
+</div>
+<video id="video" autoplay playsinline muted></video>
+<script>
+    function sendEvent(data) {
+        if (!hasReceivedFrame) {
+            return;
+        }
+        if (socket.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        socket.send(JSON.stringify(data));
+    }
+    function sendResize() {
+        sendEvent({
+            type: "resize",
+            width: window.innerWidth,
+            height: window.innerHeight
+        });
+    }
+
+    window.addEventListener("resize", sendResize);
+    let hasReceivedFrame = false
+    const sensitivity = 0.002;
+    const eventDeltaSense = 0.04;
+    const video = document.getElementById("video");
+    const loading = document.getElementById("loading");
+    const statsElement = document.getElementById("stats");
+    let currentGameId = sessionStorage.getItem("gameId") || "-";
+    let targetIndex = sessionStorage.getItem("targetIndex") || "-";
+
+    // =====================================================
+    // WEBSOCKET
+    // =====================================================
+    //const socket = new WebSocket(`ws://localhost:8088/ws`);
+    const socket = new WebSocket("wss://www.gabrielexamples.app/ws");
+    // =====================================================
+    // WEBRTC
+    // =====================================================
+    const configuration = {
+        iceServers: [
+            {
+                urls: "stun:stun.l.google.com:19302"
+            }
+        ]
+    };
+    const pc = new RTCPeerConnection(configuration);
+    // =====================================================
+    // RECEIVE VIDEO
+    // =====================================================
+
+    async function updateWebRTCStats() {
+        const stats = await pc.getStats();
+
+        let codec = "-";
+        let fps = 0;
+        let width = 0;
+        let height = 0;
+
+        let inboundVideo = null;
+
+        stats.forEach(report => {
+            if (report.type === "inbound-rtp" && report.kind === "video") {
+                inboundVideo = report;
+            }
+        });
+
+        if (inboundVideo) {
+            fps = inboundVideo.framesPerSecond ?? 0;
+            width = inboundVideo.frameWidth ?? 0;
+            height = inboundVideo.frameHeight ?? 0;
+
+            if (inboundVideo.codecId) {
+                const codecReport = stats.get(inboundVideo.codecId);
+
+                if (codecReport) {
+                    codec = codecReport.mimeType;
+                }
+            }
+        }
+
+        statsElement.innerHTML = `
+        Codec: ${codec}
+        <br>
+        FPS: ${fps}
+        <br>
+        Resolution: ${width} × ${height}
+        <br>
+        Game: ${currentGameId}
+        <br>
+        Player: ${targetIndex}
+    `;
+    }
+    setInterval(updateWebRTCStats, 1000);
+    // =====================================================
+    // RECEIVE VIDEO
+    // =====================================================
+    pc.ontrack = (event) => {
+        video.srcObject = event.streams[0];
+        hasReceivedFrame = false;
+        if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
+            video.requestVideoFrameCallback(() => {
+                hasReceivedFrame = true;
+                sendResize();
+            });
+        } else {
+            video.addEventListener("playing", () => {
+                hasReceivedFrame = true;
+                sendResize();
+            }, { once: true });
+        }
+    };
+    // =====================================================
+    // ICE
+    // =====================================================
+    pc.onicecandidate = (event) => {
+        if (!event.candidate)
+            return;
+        socket.send(JSON.stringify({
+            type: "ice",
+            candidate: event.candidate.toJSON()
+        }));
+    };
+    pc.oniceconnectionstatechange = () => {
+        console.log("Receiver ICE:", pc.iceConnectionState);
+    };
+    pc.onconnectionstatechange = () => {
+        console.log("Receiver connection:", pc.connectionState);
+    };
+    pc.onsignalingstatechange = () => {
+        console.log("signaling connection:", pc.signalingState);
+    };
+    // =====================================================
+    // WEBSOCKET
+    // =====================================================
+    socket.onmessage = async (event) => {
+        const data = JSON.parse(event.data);
+        // -------------------------------------------------
+        // OFFER
+        // -------------------------------------------------
+        if (data.type === "offer") {
+            console.log("Offer received");
+            await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+            const answer = await pc.createAnswer();
+
+            await pc.setLocalDescription(answer);
+            socket.send(JSON.stringify({
+                type: "answer",
+                sdp: {
+                    type: pc.localDescription.type,
+                    sdp: pc.localDescription.sdp
+                }
+            }));
+            return;
+        }
+        // -------------------------------------------------
+        // ICE
+        // -------------------------------------------------
+
+        if (data.type === "ice") {
+            console.log("ICE received");
+            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+            return;
+        }
+
+        if (data.type === "sessionCreated") {
+            loading.style.display = "none";
+            sessionStorage.setItem("sessionId", data.sessionId);
+            sessionStorage.setItem("gameId", data.gameId);
+            sessionStorage.setItem("targetIndex", data.targetIndex);
+
+            currentGameId = data.gameId;
+            targetIndex =  data.targetIndex
+            console.log("Session creada:", data.sessionId);
+            console.log("gameId:", data.gameId);
+            console.log("Target index:", data.targetIndex);
+            return;
+        }
+        if (data.type === "forceRecreate") {
+            console.log("Session no longer exists. Creating a new session.");
+            sessionStorage.removeItem("sessionId");
+            sessionStorage.removeItem("gameId");
+            sessionStorage.removeItem("targetIndex");
+
+            window.location.reload();
+        }
+        if (data.type === "sessionReconnected") {
+            loading.style.display = "none";
+            currentGameId = data.gameId;
+            targetIndex =  data.targetIndex
+
+            console.log("Player reconnected:", data.sessionId);
+            console.log("Game session:", data.gameId);
+            console.log("Target index:", data.targetIndex);
+        }
+    };
+
+    socket.onopen = () => {
+        console.log("Receiver WebSocket connected");
+        const sessionId = sessionStorage.getItem("sessionId");
+        const gameId = sessionStorage.getItem("gameId");
+        const targetIndex = sessionStorage.getItem("targetIndex");
+
+        console.log("localStorage sessionId:", sessionId);
+        console.log("localStorage gameId:", gameId);
+        console.log("targetIndex gameId:", targetIndex);
+
+        console.log("URL:", window.location.href);
+        const message = sessionId && gameId
+            ? {
+                type: "reconnectSession",
+                role: "receiver",
+                sessionId,
+                gameId
+            }
+            : {
+                type: "createSession",
+                role: "receiver"
+            };
+
+        console.log("ENVIANDO MENSAJE INICIAL:", message);
+
+        socket.send(JSON.stringify(message));
+    };
+
+    video.addEventListener("pointerup", (e) => {
+        e.preventDefault();
+        const movementX = e.movementX * sensitivity;
+        const movementY = e.movementY * sensitivity;
+
+        sendEvent({
+            type: "pointerup",
+            value: "true",
+            movementX,
+            movementY,
+            button: e.button,
+            buttons: e.buttons
+        })
+
+    });
+    video.addEventListener("pointerdown", async (e) => {
+        e.preventDefault();
+        try {
+            await video.play();
+        } catch (error) {
+            console.log("video.play:", error);
+        }
+        const rect = video.getBoundingClientRect();
+        const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        const y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        const movementX = e.movementX * sensitivity;
+        const movementY = e.movementY * sensitivity;
+
+        sendEvent({
+            type: "pointerdown",
+            x,
+            y,
+            clientX: e.clientX,
+            clientY : e.clientY,
+            movementX,
+            movementY,
+            button: e.button,
+            buttons: e.buttons
+        })
+
+    });
+
+
+    video.addEventListener("pointermove", (e) => {
+        e.preventDefault();
+        const rect = video.getBoundingClientRect();
+
+        const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        const y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        const movementX = e.movementX * sensitivity;
+        const movementY = e.movementY * sensitivity;
+        sendEvent({
+            type: "pointermove",
+            x,
+            y,
+            movementX,
+            movementY,
+            button: e.button,
+            buttons: e.buttons
+        })
+
+    });
+
+
+    video.addEventListener("wheel", (e) => {
+        e.preventDefault();
+
+        sendEvent({
+            type: "wheel",
+            eventY: e.deltaY*eventDeltaSense
+        })
+    });
+
+    video.addEventListener("pointerenter", (e) => {
+        e.preventDefault();
+
+        sendEvent({
+            type: "pointerenter",
+            value: "true"
+        })
+
+    });
+    video.addEventListener("pointerleave", (e) => {
+        e.preventDefault();
+
+        sendEvent({
+            type: "pointerleave",
+            value: "true"
+        })
+
+    });
+
+    video.addEventListener("click", (e) => {
+        e.preventDefault();
+        const rect = video.getBoundingClientRect();
+
+        const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        const y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+        const movementX = e.movementX * sensitivity;
+        const movementY = e.movementY * sensitivity;
+
+        sendEvent({
+            type: "click",
+            x,
+            y,
+            movementX,
+            movementY,
+            button: e.button,
+            buttons: e.buttons
+        })
+
+    });
+
+    window.addEventListener("blur", (e) => {
+        e.preventDefault();
+
+        sendEvent({
+            type: "blur",
+            value: "true"
+        })
+
+    });
+    window.addEventListener("keyup", (e) => {
+        e.preventDefault();
+
+        sendEvent({
+            type: "keyup",
+            code: e.code,
+            key: e.key
+        })
+
+    });
+
+    window.addEventListener("keydown", (e) => {
+        e.preventDefault();
+
+        sendEvent({
+            type: "keydown",
+            code: e.code,
+            key: e.key,
+            repeat: e.repeat
+        })
+    });
+
+    window.addEventListener("visibilitychange", (e) => {
+        e.preventDefault();
+
+        sendEvent({
+            type: "visibilitychange",
+            value: "true"
+        })
+
+    });
+
+    window.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+    });
+</script>
+</body>
+</html>
